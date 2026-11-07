@@ -1,14 +1,23 @@
 /*
- * Temporary PMW3610 SDIO input-bias diagnostic for nice!nano v2.
- * Uses project-verified GPIOs: SCLK=P0.08, SDIO=P0.17, NCS=P0.20.
+ * Temporary PMW3610 sensor-pad GPIO level test for nice!nano v2 / ZMK.
  *
- * Prerequisites:
+ * Purpose: make known, long-lasting logic levels that can be measured
+ * with a DC multimeter at the breakout's SENSOR FOOTPRINT pads.
+ *
+ * Pins verified for this project:
+ *   P0.08 -> SCLK, P0.17 -> SDIO, P0.20 -> NCS.
+ *
+ * Preconditions (keep the existing temporary GPIO probe configuration):
  *   CONFIG_PMW3610_GPIO_PROBE=y
  *   CONFIG_PMW3610_ALT=n
- *   CONFIG_SPI=n and &spi0 { status = "disabled"; };
+ *   CONFIG_SPI=n
+ *   &spi0 { status = "disabled"; };
  *
- * A normal sensor driver must NOT operate concurrently with this test.
- * Reads registers only; does not enable motion or alter sensor settings.
+ * GPIO outputs are changed only while NCS is high (except NCS itself).
+ * SDIO is NEVER driven when NCS is low, avoiding contention with the IC.
+ * This test does not read registers, issue sensor reset commands, or
+ * enable motion output. Restore the normal driver after diagnostics.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -17,72 +26,29 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
-#include <stdint.h>
 
 LOG_MODULE_REGISTER(pmw3610_gpio_probe, LOG_LEVEL_INF);
 
-#define SCLK_PIN        8U
-#define SDIO_PIN        17U
-#define NCS_PIN         20U
-#define BIT_DELAY_US    3U
-#define TURNAROUND_US  20U
+#define SCLK_PIN 8U
+#define SDIO_PIN 17U
+#define NCS_PIN 20U
+#define TEST_DURATION_MS 35000
 
 static const struct device *const port0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 
-/* Mode 3: idle clock high, address shifted most-significant bit first. */
-static void send_address(uint8_t address)
+static int setup_idle(void)
 {
-    for (int bit = 7; bit >= 0; bit--) {
-        gpio_pin_set(port0, SCLK_PIN, 0);
-        gpio_pin_set(port0, SDIO_PIN, (address >> bit) & 1U);
-        k_busy_wait(BIT_DELAY_US);
-        gpio_pin_set(port0, SCLK_PIN, 1);
-        k_busy_wait(BIT_DELAY_US);
-    }
+    int rc;
+    rc = gpio_pin_configure(port0, NCS_PIN, GPIO_OUTPUT_HIGH);
+    if (rc < 0) { return rc; }
+    rc = gpio_pin_configure(port0, SCLK_PIN, GPIO_OUTPUT_HIGH);
+    if (rc < 0) { return rc; }
+    return gpio_pin_configure(port0, SDIO_PIN, GPIO_INPUT);
 }
 
-/* bias must be 0, GPIO_PULL_UP, or GPIO_PULL_DOWN. */
-static int read_register_with_bias(uint8_t reg, gpio_flags_t bias)
+static void rest_measurement(void)
 {
-    uint8_t value = 0;
-    int rc = gpio_pin_configure(port0, SDIO_PIN, GPIO_OUTPUT_LOW);
-    if (rc < 0) {
-        return rc;
-    }
-
-    gpio_pin_set(port0, SCLK_PIN, 1);
-    gpio_pin_set(port0, NCS_PIN, 0);
-    k_busy_wait(5);
-    send_address(reg & 0x7FU);
-
-    /* Release SDIO before the sensor's response. The weak pull is only
-     * enabled during the input phase, never while driving an address.
-     */
-    rc = gpio_pin_configure(port0, SDIO_PIN, GPIO_INPUT | bias);
-    if (rc < 0) {
-        goto cleanup;
-    }
-    k_busy_wait(TURNAROUND_US);
-
-    for (int bit = 7; bit >= 0; bit--) {
-        gpio_pin_set(port0, SCLK_PIN, 0);
-        k_busy_wait(BIT_DELAY_US);
-        rc = gpio_pin_get_raw(port0, SDIO_PIN);
-        if (rc < 0) {
-            goto cleanup;
-        }
-        value |= (uint8_t)((rc & 1) << bit);
-        gpio_pin_set(port0, SCLK_PIN, 1);
-        k_busy_wait(BIT_DELAY_US);
-    }
-    rc = (int)value;
-
-cleanup:
-    gpio_pin_set(port0, SCLK_PIN, 1);
-    gpio_pin_set(port0, NCS_PIN, 1);
-    (void)gpio_pin_configure(port0, SDIO_PIN, GPIO_INPUT);
-    k_busy_wait(20);
-    return rc;
+    k_msleep(TEST_DURATION_MS);
 }
 
 static void probe_thread(void *a, void *b, void *c)
@@ -93,54 +59,67 @@ static void probe_thread(void *a, void *b, void *c)
 
     k_msleep(1800);
     if (!device_is_ready(port0)) {
-        LOG_ERR("GPIO0 not ready");
+        LOG_ERR("GPIO0 is not ready");
         return;
     }
 
-    int rc = gpio_pin_configure(port0, NCS_PIN, GPIO_OUTPUT_HIGH);
-    if (rc == 0) {
-        rc = gpio_pin_configure(port0, SCLK_PIN, GPIO_OUTPUT_HIGH);
-    }
-    if (rc == 0) {
-        rc = gpio_pin_configure(port0, SDIO_PIN, GPIO_INPUT);
-    }
+    int rc = setup_idle();
     if (rc < 0) {
-        LOG_ERR("GPIO setup failed: %d", rc);
+        LOG_ERR("Cannot configure GPIO outputs: %d", rc);
         return;
     }
 
-    LOG_INF("SDIO bias test: SCLK=P0.08 SDIO=P0.17 NCS=P0.20 (SPI0 disabled)");
-    LOG_INF("Expected: PRODUCT_ID=0x3e, inverse PRODUCT_ID=0xc1");
+    LOG_INF("Pad-level test uses P0.20=NCS, P0.08=SCLK, P0.17=SDIO");
+    LOG_INF("Each stage holds for 35 seconds. DC volts, black probe at breakout GND.");
 
-    const struct {
-        const char *name;
-        gpio_flags_t flags;
-    } modes[] = {
-        { "FLOAT", 0 },
-        { "PULL_UP", GPIO_PULL_UP },
-        { "PULL_DOWN", GPIO_PULL_DOWN },
-    };
+    /* Test 29: NCS must become LOW at sensor pad 5. SDIO is an input. */
+    rc = gpio_pin_set(port0, NCS_PIN, 0);
+    if (rc < 0) { goto gpio_failure; }
+    LOG_INF("TEST 29 NOW (35s): measure SENSOR PAD 5 NCS, expected ~0 V");
+    rest_measurement();
 
-    for (int attempt = 1; attempt <= 2; attempt++) {
-        for (size_t mode = 0; mode < ARRAY_SIZE(modes); mode++) {
-            int product = read_register_with_bias(0x00, modes[mode].flags);
-            int inverse = read_register_with_bias(0x3F, modes[mode].flags);
-            if (product < 0 || inverse < 0) {
-                LOG_ERR("Attempt %d %s: GPIO error: product=%d inverse=%d",
-                        attempt, modes[mode].name, product, inverse);
-            } else {
-                LOG_INF("Attempt %d %s: PRODUCT=0x%02x INVERSE=0x%02x",
-                        attempt, modes[mode].name, product, inverse);
-            }
-            k_msleep(50);
-        }
+    /* Return to deselected state before changing other signals. */
+    rc = gpio_pin_set(port0, NCS_PIN, 1);
+    if (rc < 0) { goto gpio_failure; }
+    k_busy_wait(100);
+
+    /* Test 30: SCLK LOW at sensor pad 3, with sensor deselected. */
+    rc = gpio_pin_set(port0, SCLK_PIN, 0);
+    if (rc < 0) { goto gpio_failure; }
+    LOG_INF("TEST 30 NOW (35s): measure SENSOR PAD 3 SCLK, expected ~0 V");
+    rest_measurement();
+
+    /* Test 31: SCLK HIGH at sensor pad 3, with sensor deselected. */
+    rc = gpio_pin_set(port0, SCLK_PIN, 1);
+    if (rc < 0) { goto gpio_failure; }
+    LOG_INF("TEST 31 NOW (35s): measure SENSOR PAD 3 SCLK, expected ~3.3 V");
+    rest_measurement();
+
+    /* Test 32: SDIO HIGH with NCS HIGH; sensor must be deselected. */
+    rc = gpio_pin_configure(port0, SDIO_PIN, GPIO_OUTPUT_HIGH);
+    if (rc < 0) { goto gpio_failure; }
+    LOG_INF("TEST 32 NOW (35s): measure SENSOR PAD 2 SDIO, expected ~3.3 V");
+    rest_measurement();
+
+    /* Test 33: SDIO LOW with NCS HIGH. */
+    rc = gpio_pin_set(port0, SDIO_PIN, 0);
+    if (rc < 0) { goto gpio_failure; }
+    LOG_INF("TEST 33 NOW (35s): measure SENSOR PAD 2 SDIO, expected ~0 V");
+    rest_measurement();
+
+    LOG_INF("Tests 29-33 complete; restoring idle pins");
+    rc = setup_idle();
+    if (rc < 0) {
+        LOG_ERR("Could not restore idle pins: %d", rc);
     }
+    return;
 
-    gpio_pin_set(port0, NCS_PIN, 1);
-    gpio_pin_set(port0, SCLK_PIN, 1);
-    (void)gpio_pin_configure(port0, SDIO_PIN, GPIO_INPUT);
-    LOG_INF("SDIO bias test complete; pins left idle");
+gpio_failure:
+    LOG_ERR("GPIO operation failed: %d; restoring idle pins", rc);
+    (void)setup_idle();
 }
 
 K_THREAD_DEFINE(pmw3610_gpio_probe_tid, 1536, probe_thread,
                 NULL, NULL, NULL, 7, 0, 0);
+
+
